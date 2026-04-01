@@ -103,8 +103,13 @@ if (!(Test-Path $StateDir)) { New-Item -ItemType Directory -Path $StateDir -Forc
 if (!(Test-Path $StateFile)) { New-Item -ItemType File -Path $StateFile -Force | Out-Null }
 Write-Log "Script launched. PS version: $($PSVersionTable.PSVersion)"
 
-# Scheduled task persists across reboots - no registry write needed
-Write-Log "Script launched from: $($MyInvocation.MyCommand.Path)"
+# Ensure scheduled task exists for reboot persistence (handles both auto and manual runs)
+$ScriptPath = $MyInvocation.MyCommand.Path
+$taskExists = schtasks /query /tn "ClientAutoSetup" 2>&1 | Select-String "ClientAutoSetup"
+if (-not $taskExists) {
+    schtasks /create /tn "ClientAutoSetup" /sc onlogon /ru "$env:USERNAME" /rl HIGHEST /tr "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Normal -File `"$ScriptPath`"" /f 2>&1 | Out-Null
+}
+Write-Log "Script launched from: $ScriptPath"
 
 # ============================================================
 # STEP 0 - PC NAME & PASSWORD
