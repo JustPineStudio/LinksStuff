@@ -581,7 +581,7 @@ try {
 
 # 2. Scheduled task + any leftover registry run keys
 Write-Host "  Removing scheduled task and registry run keys..." -ForegroundColor DarkGray
-schtasks /delete /tn "ClientAutoSetup" /f 2>&1 | Out-Null
+try { schtasks /delete /tn "ClientAutoSetup" /f 2>&1 | Out-Null } catch {}
 Remove-ItemProperty -Path $RegPath -Name $RegName      -ErrorAction SilentlyContinue
 Remove-ItemProperty -Path $RegPath -Name "ClientSetup" -ErrorAction SilentlyContinue
 
