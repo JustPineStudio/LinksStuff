@@ -103,11 +103,8 @@ if (!(Test-Path $StateDir)) { New-Item -ItemType Directory -Path $StateDir -Forc
 if (!(Test-Path $StateFile)) { New-Item -ItemType File -Path $StateFile -Force | Out-Null }
 Write-Log "Script launched. PS version: $($PSVersionTable.PSVersion)"
 
-# Persist across reboots - script resumes automatically after restart
-$ScriptPath = $MyInvocation.MyCommand.Path
-Set-ItemProperty -Path $RegPath -Name $RegName `
-    -Value "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$ScriptPath`""
-Write-Log "Registry persistence set. ScriptPath: $ScriptPath"
+# Scheduled task persists across reboots - no registry write needed
+Write-Log "Script launched from: $($MyInvocation.MyCommand.Path)"
 
 # ============================================================
 # STEP 0 - PC NAME & PASSWORD
@@ -582,8 +579,9 @@ try {
     Write-Log "AutoLogon disabled."
 } catch {}
 
-# 2. Registry run keys
-Write-Host "  Removing registry run keys..." -ForegroundColor DarkGray
+# 2. Scheduled task + any leftover registry run keys
+Write-Host "  Removing scheduled task and registry run keys..." -ForegroundColor DarkGray
+schtasks /delete /tn "ClientAutoSetup" /f 2>&1 | Out-Null
 Remove-ItemProperty -Path $RegPath -Name $RegName      -ErrorAction SilentlyContinue
 Remove-ItemProperty -Path $RegPath -Name "ClientSetup" -ErrorAction SilentlyContinue
 
