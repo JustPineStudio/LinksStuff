@@ -206,20 +206,6 @@
                 <ProtectYourPC>3</ProtectYourPC>
             </OOBE>
 
-            <!--
-                Find CompleteSetup.ps1 on the USB (searches every drive letter D through Z),
-                copy it to a local path, then register a scheduled task that runs it as the
-                current user with highest privileges on every logon — no UAC prompt needed.
-            -->
-            <FirstLogonCommands>
-                <SynchronousCommand wcm:action="add">
-                    <Order>1</Order>
-                    <CommandLine>cmd.exe /c for %d in (D E F G H I J K L M N O P Q R S T U V W X Y Z) do if exist "%d:\CompleteSetup.ps1" (mkdir "C:\ProgramData\_ClientSetup" 2>nul &amp; copy /Y "%d:\CompleteSetup.ps1" "C:\ProgramData\_ClientSetup\CompleteSetup.ps1" &amp; schtasks /create /tn "ClientAutoSetup" /sc onlogon /ru "%USERNAME%" /rl HIGHEST /tr "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Normal -File \"C:\ProgramData\_ClientSetup\CompleteSetup.ps1\"" /f)</CommandLine>
-                    <Description>Copy CompleteSetup.ps1 locally and register as elevated scheduled task</Description>
-                    <RequiresUserInput>false</RequiresUserInput>
-                </SynchronousCommand>
-            </FirstLogonCommands>
-
         </component>
     </settings>
 
