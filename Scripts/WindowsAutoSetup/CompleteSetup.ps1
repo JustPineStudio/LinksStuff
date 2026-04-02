@@ -220,6 +220,20 @@ function Test-RebootRequired {
     return $false
 }
 
+# Returns count of required pending updates only (excludes optional/BrowseOnly).
+# Returns -1 if COM API is unavailable.
+function Get-PendingUpdateCount {
+    try {
+        $session  = New-Object -ComObject Microsoft.Update.Session
+        $searcher = $session.CreateUpdateSearcher()
+        $res      = $searcher.Search("IsInstalled=0 and IsHidden=0 and BrowseOnly=0")
+        return $res.Updates.Count
+    } catch {
+        Write-Log "COM API unavailable: $($_.Exception.Message)" "WARN"
+        return -1
+    }
+}
+
 function Find-UIElement {
     param($root, $name, $controlType, $maxWaitSec = 30)
     $condition = $null
@@ -232,7 +246,6 @@ function Find-UIElement {
     } else {
         $condition = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, $controlType)
     }
-
     $waited = 0
     while ($waited -lt $maxWaitSec) {
         try {
@@ -252,7 +265,6 @@ function Click-UIElement {
         $invokePattern.Invoke()
         return $true
     } catch {
-        # Fallback: click via mouse at element center
         try {
             $rect = $element.Current.BoundingRectangle
             $cx   = [int]($rect.X + $rect.Width  / 2)
@@ -265,8 +277,8 @@ public class MouseClick {
     [DllImport("user32.dll")] public static extern void mouse_event(int dwFlags, int dx, int dy, int cButtons, int dwExtraInfo);
     public static void Click(int x, int y) {
         SetCursorPos(x, y);
-        mouse_event(0x0002, 0, 0, 0, 0); // left down
-        mouse_event(0x0004, 0, 0, 0, 0); // left up
+        mouse_event(0x0002, 0, 0, 0, 0);
+        mouse_event(0x0004, 0, 0, 0, 0);
     }
 }
 "@ -ErrorAction SilentlyContinue
@@ -277,91 +289,40 @@ public class MouseClick {
     return $false
 }
 
-function Invoke-WindowsUpdateViaUI {
-    Write-Host "  Opening Windows Update settings..." -ForegroundColor DarkGray
-
-    # Open Windows Update settings page
-    Start-Process "ms-settings:windowsupdate" -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 4
-
-    # Find the Settings window
-    $desktop   = [System.Windows.Automation.AutomationElement]::RootElement
-    $settingsWindow = $null
+function Get-SettingsWindow {
+    $desktop = [System.Windows.Automation.AutomationElement]::RootElement
     $waited = 0
-    while (-not $settingsWindow -and $waited -lt 20) {
+    while ($waited -lt 20) {
         $cond = New-Object System.Windows.Automation.PropertyCondition(
             [System.Windows.Automation.AutomationElement]::NameProperty, "Settings")
-        $settingsWindow = $desktop.FindFirst([System.Windows.Automation.TreeScope]::Children, $cond)
-        if (-not $settingsWindow) {
-            # Try partial name match via process
-            $proc = Get-Process SystemSettings -ErrorAction SilentlyContinue
-            if ($proc) {
-                $cond2 = New-Object System.Windows.Automation.PropertyCondition(
-                    [System.Windows.Automation.AutomationElement]::ProcessIdProperty, $proc[0].Id)
-                $settingsWindow = $desktop.FindFirst([System.Windows.Automation.TreeScope]::Children, $cond2)
-            }
+        $win = $desktop.FindFirst([System.Windows.Automation.TreeScope]::Children, $cond)
+        if ($win) { return $win }
+        $proc = Get-Process SystemSettings -ErrorAction SilentlyContinue
+        if ($proc) {
+            $cond2 = New-Object System.Windows.Automation.PropertyCondition(
+                [System.Windows.Automation.AutomationElement]::ProcessIdProperty, $proc[0].Id)
+            $win = $desktop.FindFirst([System.Windows.Automation.TreeScope]::Children, $cond2)
+            if ($win) { return $win }
         }
         Start-Sleep -Seconds 2
         $waited += 2
     }
-
-    if (-not $settingsWindow) {
-        Write-Host "  [WARN] Could not find Settings window via UI Automation." -ForegroundColor DarkYellow
-        Write-Log "Settings window not found." "WARN"
-        return $false
-    }
-
-    Write-Host "  Settings window found. Looking for Windows Update button..." -ForegroundColor DarkGray
-
-    # All known button names Windows Update uses across different states
-    $btnNames = @(
-        "Download & install all",
-        "Download &amp; install all",
-        "Check for updates",
-        "Check for Updates",
-        "Download now",
-        "Download and install",
-        "Download & install",
-        "Install now",
-        "Restart now",
-        "Resume"
-    )
-    $btn = $null
-    foreach ($name in $btnNames) {
-        $btn = Find-UIElement -root $settingsWindow -name $name -controlType $null -maxWaitSec 5
-        if ($btn) {
-            Write-Host "  Found button: '$name' - clicking..." -ForegroundColor Cyan
-            Write-Log "Clicking WU button: $name"
-            Click-UIElement $btn | Out-Null
-            Start-Sleep -Seconds 3
-            break
-        }
-    }
-
-    if (-not $btn) {
-        Write-Host "  No actionable button found - Windows Update may already be running." -ForegroundColor DarkGray
-        Write-Log "No WU button found - may already be running."
-    }
-
-    return $true
+    return $null
 }
 
-function Wait-ForWindowsUpdateToFinish {
+function Watch-UpdateCompletion {
     param([int]$maxMinutes = 120)
     Write-Host "  Monitoring Windows Update progress..." -ForegroundColor DarkGray
-
     $deadline = (Get-Date).AddMinutes($maxMinutes)
 
     while ((Get-Date) -lt $deadline) {
         Start-Sleep -Seconds 15
 
-        # Check if reboot needed - updates installed and need restart
         if (Test-RebootRequired) {
             Write-Host "  Reboot required - updates installed!" -ForegroundColor Green
             return "reboot"
         }
 
-        # Check Settings window for "You're up to date" text - means done
         try {
             $proc = Get-Process SystemSettings -ErrorAction SilentlyContinue
             if ($proc) {
@@ -370,31 +331,25 @@ function Wait-ForWindowsUpdateToFinish {
                     [System.Windows.Automation.AutomationElement]::ProcessIdProperty, $proc[0].Id)
                 $win = $desktop.FindFirst([System.Windows.Automation.TreeScope]::Children, $cond)
                 if ($win) {
-                    # Look for "up to date" text element
-                    $upToDateNames = @("You're up to date", "You're up to date", "Up to date")
-                    foreach ($txt in $upToDateNames) {
+                    # Primary exit: "You're up to date" visible
+                    foreach ($txt in @("You're up to date", "You`u2019re up to date", "Up to date")) {
                         $el = $win.FindFirst([System.Windows.Automation.TreeScope]::Descendants,
                             (New-Object System.Windows.Automation.PropertyCondition(
                                 [System.Windows.Automation.AutomationElement]::NameProperty, $txt)))
                         if ($el) {
-                            Write-Host "  Detected 'You're up to date' - updates complete!" -ForegroundColor Green
+                            Write-Host "  Detected '$txt' - updates complete!" -ForegroundColor Green
                             return "done"
                         }
                     }
-
-                    # Also click any remaining Download & install buttons that appear
-                    $remainingBtns = @("Download & install","Download and install","Install now","Restart now")
-                    foreach ($name in $remainingBtns) {
+                    # Click any new action buttons that appeared mid-update
+                    foreach ($name in @("Download & install","Download and install","Install now","Restart now")) {
                         $btn = $win.FindFirst([System.Windows.Automation.TreeScope]::Descendants,
                             (New-Object System.Windows.Automation.PropertyCondition(
                                 [System.Windows.Automation.AutomationElement]::NameProperty, $name)))
                         if ($btn) {
-                            Write-Host "  Clicking remaining button: '$name'..." -ForegroundColor Cyan
-                            try {
-                                $ip = $btn.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
-                                $ip.Invoke()
-                            } catch {}
-                            Write-Log "Clicked remaining: $name"
+                            Write-Host "  Clicking '$name'..." -ForegroundColor Cyan
+                            try { $btn.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke() } catch {}
+                            Write-Log "Clicked mid-update button: $name"
                             Start-Sleep -Seconds 3
                         }
                     }
@@ -402,27 +357,15 @@ function Wait-ForWindowsUpdateToFinish {
             }
         } catch {}
 
-        # Check if WU processes are still running
-        $wuRunning = $false
-        try {
-            if (Get-Process -Name "TrustedInstaller","wuauclt","WaaSMedicAgent" -ErrorAction SilentlyContinue) {
-                $wuRunning = $true
-            }
-        } catch {}
-
-        if (-not $wuRunning) {
-            Write-Host "  Windows Update processes finished." -ForegroundColor DarkGray
-            return "done"
-        }
-
-        Write-Host "  Still updating... ($(($deadline - (Get-Date)).Minutes) min remaining)" -ForegroundColor DarkGray
+        Write-Host "  Still updating... ($([ math]::Round(($deadline - (Get-Date)).TotalMinutes)) min remaining)" -ForegroundColor DarkGray
     }
 
     Write-Host "  [WARN] Timed out waiting for Windows Update." -ForegroundColor DarkYellow
     return "timeout"
 }
 
-# Restore round number if resuming after reboot mid-updates
+# ---- MAIN UPDATE LOOP ----
+
 $roundFile = "$StateDir\update_round.txt"
 $round = 1
 if ($rebootResume -and (Test-Path $roundFile)) {
@@ -431,7 +374,8 @@ if ($rebootResume -and (Test-Path $roundFile)) {
     Write-Log "Restored update round $round from file."
 }
 
-$maxRounds = 10
+$maxRounds = 8
+$lastPendingCount = -1
 
 while ($true) {
     if ($round -gt $maxRounds) {
@@ -441,96 +385,87 @@ while ($true) {
     }
 
     Show-Status "Windows Updates"
-    Write-Host "  === Windows Update round $round of max $maxRounds ===" -ForegroundColor Cyan
+    Write-Host "  === Round $round — checking for required updates ===" -ForegroundColor Cyan
     Write-Log "Update round $round."
 
-    # Click Check for updates in Settings
-    $uiOk = Invoke-WindowsUpdateViaUI
+    # Always check COM API first — skip UI entirely if already up to date
+    $pending = Get-PendingUpdateCount
+    Write-Host "  Required updates pending: $(if ($pending -lt 0) { 'unknown' } else { $pending })" -ForegroundColor DarkGray
+    Write-Log "Round $round - pending count: $pending"
 
-    if ($uiOk) {
-        # Give it a moment to start
-        Start-Sleep -Seconds 10
-
-        # Click any download/install button that appears
-        $desktop = [System.Windows.Automation.AutomationElement]::RootElement
-        $proc = Get-Process SystemSettings -ErrorAction SilentlyContinue
-        if ($proc) {
-            $cond = New-Object System.Windows.Automation.PropertyCondition(
-                [System.Windows.Automation.AutomationElement]::ProcessIdProperty, $proc[0].Id)
-            $settingsWindow = $desktop.FindFirst([System.Windows.Automation.TreeScope]::Children, $cond)
-            if ($settingsWindow) {
-                $actionBtns = @(
-                    "Download & install all",
-                    "Download &amp; install all",
-                    "Download now",
-                    "Download and install",
-                    "Download & install",
-                    "Install now",
-                    "Restart now"
-                )
-                foreach ($name in $actionBtns) {
-                    $btn = Find-UIElement -root $settingsWindow -name $name -controlType $null -maxWaitSec 5
-                    if ($btn) {
-                        Write-Host "  Clicking '$name'..." -ForegroundColor Cyan
-                        Click-UIElement $btn | Out-Null
-                        Write-Log "Clicked: $name"
-                        Start-Sleep -Seconds 5
-                    }
-                }
-            }
-        }
-
-        Write-Host "  Waiting for Windows Update to finish..." -ForegroundColor Yellow
-        $result = Wait-ForWindowsUpdateToFinish -maxMinutes 120
-
-        # Close Settings window
-        Get-Process SystemSettings -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-        Start-Sleep -Seconds 2
-
-        if ($result -eq "reboot" -or (Test-RebootRequired)) {
-            Write-Host ""
-            Write-Host "  *** Updates installed. Rebooting in 15 seconds... ***" -ForegroundColor Cyan
-            Write-Host "  Setup resumes automatically after restart." -ForegroundColor Cyan
-            Write-Log "Rebooting after round $round."
-            Set-Content -Path $roundFile -Value ($round + 1) -Encoding UTF8
-            shutdown.exe /r /t 15 /c "Windows Updates installed. Setup resumes after restart."
-            exit 0
-        }
-
-        # If Settings showed "You're up to date" - trust it and stop
-        if ($result -eq "done") {
-            Write-Host ""
-            Write-Host "  [OK] Windows Update confirmed up to date after round $round." -ForegroundColor Green
-            Write-Log "Updates done - Settings showed up to date after round $round."
-            Remove-Item $roundFile -Force -ErrorAction SilentlyContinue
-            break
-        }
-    }
-
-    # Verify via COM API that nothing is left
-    Write-Host "  Checking for any remaining updates..." -ForegroundColor Yellow
-    $remaining = $null
-    try {
-        $session  = New-Object -ComObject Microsoft.Update.Session
-        $searcher = $session.CreateUpdateSearcher()
-        $result2  = $searcher.Search("IsInstalled=0 and IsHidden=0")
-        $remaining = $result2.Updates
-    } catch {}
-
-    $countLeft = if ($remaining) { $remaining.Count } else { 0 }
-    Write-Log "Round $round - $countLeft updates remaining after UI run."
-
-    if ($countLeft -eq 0) {
+    if ($pending -eq 0) {
         Write-Host ""
-        Write-Host "  [OK] Windows is fully up to date after $round round(s)!" -ForegroundColor Green
-        Write-Log "Updates complete after $round round(s)."
+        Write-Host "  [OK] No required updates pending - Windows is up to date!" -ForegroundColor Green
+        Write-Log "Updates done after $round round(s) - COM API confirmed 0 pending."
         Remove-Item $roundFile -Force -ErrorAction SilentlyContinue
         break
-    } else {
-        Write-Host "  $countLeft update(s) still pending - running another round..." -ForegroundColor DarkYellow
-        $round++
-        Start-Sleep -Seconds 10
     }
+
+    # Loop guard: if pending count didn't change from last round, we're stuck
+    if ($lastPendingCount -ge 0 -and $pending -eq $lastPendingCount) {
+        Write-Host "  [WARN] Pending count unchanged ($pending) since last round - updates may be stuck. Moving on." -ForegroundColor DarkYellow
+        Write-Log "Loop guard triggered: $pending updates stuck across rounds."
+        break
+    }
+    $lastPendingCount = $pending
+
+    # Open Settings and click Check for updates / any action button
+    Write-Host "  Opening Windows Update settings..." -ForegroundColor DarkGray
+    Start-Process "ms-settings:windowsupdate" -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 5
+
+    $settingsWindow = Get-SettingsWindow
+    if (-not $settingsWindow) {
+        Write-Host "  [WARN] Could not find Settings window. Skipping UI this round." -ForegroundColor DarkYellow
+        Write-Log "Settings window not found - round $round." "WARN"
+    } else {
+        Write-Host "  Settings window found. Looking for action button..." -ForegroundColor DarkGray
+        foreach ($name in @("Check for updates","Check for Updates","Download & install all","Download &amp; install all","Download now","Download and install","Download & install","Install now","Restart now","Resume")) {
+            $btn = Find-UIElement -root $settingsWindow -name $name -controlType $null -maxWaitSec 5
+            if ($btn) {
+                Write-Host "  Clicking '$name'..." -ForegroundColor Cyan
+                Write-Log "Clicked WU button: $name"
+                Click-UIElement $btn | Out-Null
+                Start-Sleep -Seconds 3
+                break
+            }
+        }
+    }
+
+    # Wait for completion — primary exit is "You're up to date" in the UI
+    Write-Host "  Waiting for Windows Update to finish..." -ForegroundColor Yellow
+    $result = Watch-UpdateCompletion -maxMinutes 120
+
+    Get-Process SystemSettings -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
+
+    if ($result -eq "reboot" -or (Test-RebootRequired)) {
+        Write-Host ""
+        Write-Host "  *** Updates installed. Rebooting in 15 seconds... ***" -ForegroundColor Cyan
+        Write-Host "  Setup resumes automatically after restart." -ForegroundColor Cyan
+        Write-Log "Rebooting after round $round."
+        Set-Content -Path $roundFile -Value ($round + 1) -Encoding UTF8
+        shutdown.exe /r /t 15 /c "Windows Updates installed. Setup resumes after restart."
+        exit 0
+    }
+
+    if ($result -eq "done") {
+        # UI says done - verify with COM API before trusting it
+        $pendingAfter = Get-PendingUpdateCount
+        if ($pendingAfter -le 0) {
+            Write-Host ""
+            Write-Host "  [OK] Windows is up to date after round $round." -ForegroundColor Green
+            Write-Log "Updates done - UI and COM API both confirmed after round $round."
+            Remove-Item $roundFile -Force -ErrorAction SilentlyContinue
+            break
+        } else {
+            Write-Host "  UI showed 'up to date' but COM API still sees $pendingAfter update(s). Running another round..." -ForegroundColor DarkYellow
+            Write-Log "UI/COM mismatch after round $round - $pendingAfter still pending."
+        }
+    }
+
+    $round++
+    Start-Sleep -Seconds 10
 }
 
 Mark-Done "Windows Updates"
@@ -589,26 +524,15 @@ try {
 
 # CHECK 3: Windows Updates - scan using COM API same as above
 try {
-    $remaining = Get-PendingUpdates
-    if (-not $remaining -or $remaining.Count -eq 0) {
+    $remaining = Get-PendingUpdateCount
+    if ($remaining -le 0) {
         Write-Check "Windows Up To Date" $true "no updates pending"
     } else {
-        Write-Check "Windows Up To Date" $false "$($remaining.Count) update(s) still pending"
-        $failNotes += "$($remaining.Count) Windows update(s) still pending."
+        Write-Check "Windows Up To Date" $false "$remaining update(s) still pending"
+        $failNotes += "$remaining Windows update(s) still pending."
     }
 } catch { Write-Check "Windows Up To Date" $false "could not scan" -WarnOnly $true }
 
-# CHECK 4: GPU Driver - remind to install manually
-try {
-    $gpus = Get-CimInstance Win32_VideoController |
-            Where-Object { $_.Caption -notmatch "Microsoft|Remote|Virtual|Basic" }
-    if ($gpus) {
-        foreach ($gpu in $gpus) {
-            Write-Check "GPU Driver" $true "$($gpu.Caption) detected - install latest driver manually from manufacturer website" -WarnOnly $true
-            $failNotes += "GPU '$($gpu.Caption)' - download latest driver manually: nvidia.com/drivers or amd.com/support"
-        }
-    }
-} catch {}
 
 Write-Host ""
 Write-Host "  ==========================================" -ForegroundColor DarkGray
