@@ -206,275 +206,25 @@ Start-Sleep -Seconds 1
 # ============================================================
 Show-Status "Windows Updates"
 
-Add-Type -AssemblyName UIAutomationClient
-Add-Type -AssemblyName UIAutomationTypes
-
-function Test-RebootRequired {
-    if (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired") { return $true }
-    if (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending")  { return $true }
-    try {
-        $pfr = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager" -Name PendingFileRenameOperations -ErrorAction SilentlyContinue).PendingFileRenameOperations
-        if ($pfr) { return $true }
-    } catch {}
-    try { if ((New-Object -ComObject Microsoft.Update.SystemInfo).RebootRequired) { return $true } } catch {}
-    return $false
+# Install PSWindowsUpdate module if not already present
+if (-not (Get-Module -ListAvailable -Name PSWindowsUpdate)) {
+    Write-Host "  Installing PSWindowsUpdate module..." -ForegroundColor DarkGray
+    Write-Log "Installing PSWindowsUpdate module."
+    Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force | Out-Null
+    Install-Module -Name PSWindowsUpdate -Force -Confirm:$false | Out-Null
 }
+Import-Module PSWindowsUpdate -ErrorAction Stop
 
-# Returns count of required pending updates only (excludes optional/BrowseOnly).
-# Returns -1 if COM API is unavailable.
-function Get-PendingUpdateCount {
-    try {
-        $session  = New-Object -ComObject Microsoft.Update.Session
-        $searcher = $session.CreateUpdateSearcher()
-        $res      = $searcher.Search("IsInstalled=0 and IsHidden=0 and BrowseOnly=0 and AutoSelectOnWebSites=1")
-        return $res.Updates.Count
-    } catch {
-        Write-Log "COM API unavailable: $($_.Exception.Message)" "WARN"
-        return -1
-    }
-}
+$dateStr  = Get-Date -Format "yyyy-MM-dd"
+$logPath  = "C:\$($env:COMPUTERNAME)-$dateStr-MSUpdates.log"
+Write-Host "  Running updates - log: $logPath" -ForegroundColor DarkGray
+Write-Host "  Machine will reboot automatically if needed. Setup resumes after restart." -ForegroundColor Cyan
+Write-Log "Starting Install-WindowsUpdate. Log: $logPath"
 
-function Find-UIElement {
-    param($root, $name, $controlType, $maxWaitSec = 30)
-    $condition = $null
-    if ($name -and $controlType) {
-        $cName = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty, $name)
-        $cType = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, $controlType)
-        $condition = New-Object System.Windows.Automation.AndCondition($cName, $cType)
-    } elseif ($name) {
-        $condition = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty, $name)
-    } else {
-        $condition = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, $controlType)
-    }
-    $waited = 0
-    while ($waited -lt $maxWaitSec) {
-        try {
-            $el = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
-            if ($el) { return $el }
-        } catch {}
-        Start-Sleep -Seconds 2
-        $waited += 2
-    }
-    return $null
-}
+Install-WindowsUpdate -MicrosoftUpdate -AcceptAll -AutoReboot | Out-File $logPath -Force
 
-function Click-UIElement {
-    param($element)
-    try {
-        $invokePattern = $element.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
-        $invokePattern.Invoke()
-        return $true
-    } catch {
-        try {
-            $rect = $element.Current.BoundingRectangle
-            $cx   = [int]($rect.X + $rect.Width  / 2)
-            $cy   = [int]($rect.Y + $rect.Height / 2)
-            Add-Type -TypeDefinition @"
-using System;
-using System.Runtime.InteropServices;
-public class MouseClick {
-    [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
-    [DllImport("user32.dll")] public static extern void mouse_event(int dwFlags, int dx, int dy, int cButtons, int dwExtraInfo);
-    public static void Click(int x, int y) {
-        SetCursorPos(x, y);
-        mouse_event(0x0002, 0, 0, 0, 0);
-        mouse_event(0x0004, 0, 0, 0, 0);
-    }
-}
-"@ -ErrorAction SilentlyContinue
-            [MouseClick]::Click($cx, $cy)
-            return $true
-        } catch {}
-    }
-    return $false
-}
-
-function Get-SettingsWindow {
-    $desktop = [System.Windows.Automation.AutomationElement]::RootElement
-    $waited = 0
-    while ($waited -lt 20) {
-        $cond = New-Object System.Windows.Automation.PropertyCondition(
-            [System.Windows.Automation.AutomationElement]::NameProperty, "Settings")
-        $win = $desktop.FindFirst([System.Windows.Automation.TreeScope]::Children, $cond)
-        if ($win) { return $win }
-        $proc = Get-Process SystemSettings -ErrorAction SilentlyContinue
-        if ($proc) {
-            $cond2 = New-Object System.Windows.Automation.PropertyCondition(
-                [System.Windows.Automation.AutomationElement]::ProcessIdProperty, $proc[0].Id)
-            $win = $desktop.FindFirst([System.Windows.Automation.TreeScope]::Children, $cond2)
-            if ($win) { return $win }
-        }
-        Start-Sleep -Seconds 2
-        $waited += 2
-    }
-    return $null
-}
-
-function Watch-UpdateCompletion {
-    param([int]$maxMinutes = 120)
-    Write-Host "  Monitoring Windows Update progress..." -ForegroundColor DarkGray
-    $deadline = (Get-Date).AddMinutes($maxMinutes)
-
-    while ((Get-Date) -lt $deadline) {
-        Start-Sleep -Seconds 15
-
-        if (Test-RebootRequired) {
-            Write-Host "  Reboot required - updates installed!" -ForegroundColor Green
-            return "reboot"
-        }
-
-        try {
-            $proc = Get-Process SystemSettings -ErrorAction SilentlyContinue
-            if ($proc) {
-                $desktop = [System.Windows.Automation.AutomationElement]::RootElement
-                $cond = New-Object System.Windows.Automation.PropertyCondition(
-                    [System.Windows.Automation.AutomationElement]::ProcessIdProperty, $proc[0].Id)
-                $win = $desktop.FindFirst([System.Windows.Automation.TreeScope]::Children, $cond)
-                if ($win) {
-                    # Primary exit: "You're up to date" visible
-                    foreach ($txt in @("You're up to date", "You`u2019re up to date", "Up to date")) {
-                        $el = $win.FindFirst([System.Windows.Automation.TreeScope]::Descendants,
-                            (New-Object System.Windows.Automation.PropertyCondition(
-                                [System.Windows.Automation.AutomationElement]::NameProperty, $txt)))
-                        if ($el) {
-                            Write-Host "  Detected '$txt' - updates complete!" -ForegroundColor Green
-                            return "done"
-                        }
-                    }
-                    # Click any new action buttons that appeared mid-update
-                    foreach ($name in @("Download & install","Download and install","Install now","Restart now")) {
-                        $btn = $win.FindFirst([System.Windows.Automation.TreeScope]::Descendants,
-                            (New-Object System.Windows.Automation.PropertyCondition(
-                                [System.Windows.Automation.AutomationElement]::NameProperty, $name)))
-                        if ($btn) {
-                            Write-Host "  Clicking '$name'..." -ForegroundColor Cyan
-                            try { $btn.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke() } catch {}
-                            Write-Log "Clicked mid-update button: $name"
-                            Start-Sleep -Seconds 3
-                        }
-                    }
-                }
-            }
-        } catch {}
-
-        # Also check COM API — exit immediately if 0 required updates pending
-        $comCheck = Get-PendingUpdateCount
-        if ($comCheck -eq 0) {
-            Write-Host "  COM API confirms 0 required updates pending - done!" -ForegroundColor Green
-            return "done"
-        }
-
-        Write-Host "  Still updating... ($comCheck pending, $([ math]::Round(($deadline - (Get-Date)).TotalMinutes)) min remaining)" -ForegroundColor DarkGray
-    }
-
-    Write-Host "  [WARN] Timed out waiting for Windows Update." -ForegroundColor DarkYellow
-    return "timeout"
-}
-
-# ---- MAIN UPDATE LOOP ----
-
-$roundFile = "$StateDir\update_round.txt"
-$round = 1
-if ($rebootResume -and (Test-Path $roundFile)) {
-    try { $round = [int](Get-Content $roundFile -Raw) } catch {}
-    Write-Host "  Resuming from update round $round after reboot." -ForegroundColor Cyan
-    Write-Log "Restored update round $round from file."
-}
-
-$maxRounds = 8
-$lastPendingCount = -1
-
-while ($true) {
-    if ($round -gt $maxRounds) {
-        Write-Host "  [WARN] Reached max update rounds ($maxRounds). Moving on." -ForegroundColor DarkYellow
-        Write-Log "Hit max update rounds - moving on."
-        break
-    }
-
-    Show-Status "Windows Updates"
-    Write-Host "  === Round $round — checking for required updates ===" -ForegroundColor Cyan
-    Write-Log "Update round $round."
-
-    # Always check COM API first — skip UI entirely if already up to date
-    $pending = Get-PendingUpdateCount
-    Write-Host "  Required updates pending: $(if ($pending -lt 0) { 'unknown' } else { $pending })" -ForegroundColor DarkGray
-    Write-Log "Round $round - pending count: $pending"
-
-    if ($pending -eq 0) {
-        Write-Host ""
-        Write-Host "  [OK] No required updates pending - Windows is up to date!" -ForegroundColor Green
-        Write-Log "Updates done after $round round(s) - COM API confirmed 0 pending."
-        Remove-Item $roundFile -Force -ErrorAction SilentlyContinue
-        break
-    }
-
-    # Loop guard: if pending count didn't change from last round, we're stuck
-    if ($lastPendingCount -ge 0 -and $pending -eq $lastPendingCount) {
-        Write-Host "  [WARN] Pending count unchanged ($pending) since last round - updates may be stuck. Moving on." -ForegroundColor DarkYellow
-        Write-Log "Loop guard triggered: $pending updates stuck across rounds."
-        break
-    }
-    $lastPendingCount = $pending
-
-    # Open Settings and click Check for updates / any action button
-    Write-Host "  Opening Windows Update settings..." -ForegroundColor DarkGray
-    Start-Process "ms-settings:windowsupdate" -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 5
-
-    $settingsWindow = Get-SettingsWindow
-    if (-not $settingsWindow) {
-        Write-Host "  [WARN] Could not find Settings window. Skipping UI this round." -ForegroundColor DarkYellow
-        Write-Log "Settings window not found - round $round." "WARN"
-    } else {
-        Write-Host "  Settings window found. Looking for action button..." -ForegroundColor DarkGray
-        foreach ($name in @("Check for updates","Check for Updates","Download & install all","Download &amp; install all","Download now","Download and install","Download & install","Install now","Restart now","Resume")) {
-            $btn = Find-UIElement -root $settingsWindow -name $name -controlType $null -maxWaitSec 5
-            if ($btn) {
-                Write-Host "  Clicking '$name'..." -ForegroundColor Cyan
-                Write-Log "Clicked WU button: $name"
-                Click-UIElement $btn | Out-Null
-                Start-Sleep -Seconds 3
-                break
-            }
-        }
-    }
-
-    # Wait for completion — primary exit is "You're up to date" in the UI
-    Write-Host "  Waiting for Windows Update to finish..." -ForegroundColor Yellow
-    $result = Watch-UpdateCompletion -maxMinutes 120
-
-    Get-Process SystemSettings -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 2
-
-    if ($result -eq "reboot" -or (Test-RebootRequired)) {
-        Write-Host ""
-        Write-Host "  *** Updates installed. Rebooting in 15 seconds... ***" -ForegroundColor Cyan
-        Write-Host "  Setup resumes automatically after restart." -ForegroundColor Cyan
-        Write-Log "Rebooting after round $round."
-        Set-Content -Path $roundFile -Value ($round + 1) -Encoding UTF8
-        shutdown.exe /r /t 15 /c "Windows Updates installed. Setup resumes after restart."
-        exit 0
-    }
-
-    if ($result -eq "done") {
-        # UI says done - verify with COM API before trusting it
-        $pendingAfter = Get-PendingUpdateCount
-        if ($pendingAfter -le 0) {
-            Write-Host ""
-            Write-Host "  [OK] Windows is up to date after round $round." -ForegroundColor Green
-            Write-Log "Updates done - UI and COM API both confirmed after round $round."
-            Remove-Item $roundFile -Force -ErrorAction SilentlyContinue
-            break
-        } else {
-            Write-Host "  UI showed 'up to date' but COM API still sees $pendingAfter update(s). Running another round..." -ForegroundColor DarkYellow
-            Write-Log "UI/COM mismatch after round $round - $pendingAfter still pending."
-        }
-    }
-
-    $round++
-    Start-Sleep -Seconds 10
-}
-
+Write-Host "  [OK] Windows Update complete." -ForegroundColor Green
+Write-Log "Windows Update complete - no reboot required."
 Mark-Done "Windows Updates"
 Start-Sleep -Seconds 1
 
@@ -529,10 +279,10 @@ try {
     }
 } catch { Write-Check "Time Synced" $false "could not verify" -WarnOnly $true }
 
-# CHECK 3: Windows Updates - scan using COM API same as above
+# CHECK 3: Windows Updates
 try {
-    $remaining = Get-PendingUpdateCount
-    if ($remaining -le 0) {
+    $remaining = (Get-WindowsUpdate -MicrosoftUpdate -IsInstalled:$false -ErrorAction Stop).Count
+    if ($remaining -eq 0) {
         Write-Check "Windows Up To Date" $true "no updates pending"
     } else {
         Write-Check "Windows Up To Date" $false "$remaining update(s) still pending"
@@ -577,6 +327,7 @@ try {
 
 Remove-Item "$env:TEMP\*"            -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item "$env:SystemRoot\Temp\*" -Recurse -Force -ErrorAction SilentlyContinue
+if ($logPath -and (Test-Path $logPath)) { Remove-Item $logPath -Force -ErrorAction SilentlyContinue }
 
 try { wevtutil cl Application 2>&1 | Out-Null } catch {}
 
