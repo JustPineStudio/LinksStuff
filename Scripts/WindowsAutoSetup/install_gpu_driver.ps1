@@ -140,13 +140,53 @@ if ($vendor -eq "NVIDIA") {
         Write-Host "  Downloading driver ($version) - this will take a few minutes..." -ForegroundColor Yellow
         Write-Host "  URL: $downloadUrl" -ForegroundColor DarkGray
 
-        Invoke-WebRequest -Uri $downloadUrl -OutFile $dest -Headers $headers -UseBasicParsing
+        Start-BitsTransfer -Source $downloadUrl -Destination $dest -ErrorAction SilentlyContinue
+        if (!(Test-Path $dest) -or (Get-Item $dest).Length -lt 1MB) {
+            Write-Host "  BITS download failed, trying direct download..." -ForegroundColor DarkYellow
+            Invoke-WebRequest -Uri $downloadUrl -OutFile $dest -Headers $headers -UseBasicParsing
+        }
 
-        Write-Host "  Download complete. Installing silently..." -ForegroundColor Yellow
-        Write-Host "  (This may take several minutes)" -ForegroundColor DarkGray
+        Write-Host "  Download complete." -ForegroundColor Yellow
 
-        $proc = Start-Process -FilePath $dest -Wait -PassThru
-        if ($proc.ExitCode -eq 0 -or $proc.ExitCode -eq 1) {
+        # Ensure 7-Zip is available for silent extraction
+        $7zExe = $null
+        $7zReg = Get-ItemProperty -Path "HKLM:\SOFTWARE\7-Zip\" -Name Path -ErrorAction SilentlyContinue
+        if ($7zReg) { $7zExe = $7zReg.Path + "7z.exe" }
+        if (!$7zExe -or !(Test-Path $7zExe)) {
+            Write-Host "  7-Zip not found. Installing via winget..." -ForegroundColor DarkGray
+            winget install --id 7zip.7zip --silent --accept-package-agreements --accept-source-agreements | Out-Null
+            $7zReg = Get-ItemProperty -Path "HKLM:\SOFTWARE\7-Zip\" -Name Path -ErrorAction SilentlyContinue
+            if ($7zReg) { $7zExe = $7zReg.Path + "7z.exe" }
+        }
+
+        if (!$7zExe -or !(Test-Path $7zExe)) {
+            Write-Host "  [ERROR] 7-Zip could not be found or installed." -ForegroundColor Red
+            exit 1
+        }
+
+        # Extract only driver components — no GFE, no telemetry
+        $extractDir     = "$env:TEMP\nvidia_extract_$version"
+        $filesToExtract = "Display.Driver HDAudio NVI2 PhysX EULA.txt ListDevices.txt setup.cfg setup.exe"
+        Write-Host "  Extracting driver files..." -ForegroundColor DarkGray
+        Start-Process -FilePath $7zExe `
+            -ArgumentList "x -bso0 -bsp1 -bse1 -aoa `"$dest`" $filesToExtract -o`"$extractDir`"" `
+            -Wait -NoNewWindow
+
+        # Strip EULA/consent prompts from setup.cfg so no dialogs appear
+        $cfgPath = "$extractDir\setup.cfg"
+        if (Test-Path $cfgPath) {
+            (Get-Content $cfgPath) |
+                Where-Object { $_ -notmatch 'name="\$\{\{(EulaHtmlFile|FunctionalConsentFile|PrivacyPolicyFile)\}\}"' } |
+                Set-Content $cfgPath -Encoding UTF8 -Force
+        }
+
+        # Install silently — no dialogs, no reboot, no EULA
+        Write-Host "  Installing silently (this may take several minutes)..." -ForegroundColor Yellow
+        $proc = Start-Process -FilePath "$extractDir\setup.exe" `
+                    -ArgumentList "-passive", "-noreboot", "-noeula", "-nofinish", "-s" `
+                    -Wait -PassThru -NoNewWindow
+
+        if ($proc.ExitCode -eq 0) {
             Write-Host ""
             Write-Host "  Driver installed successfully! A reboot is required." -ForegroundColor Green
         } else {
@@ -155,6 +195,7 @@ if ($vendor -eq "NVIDIA") {
         }
 
         Remove-Item $dest -Force -ErrorAction SilentlyContinue
+        Remove-Item $extractDir -Recurse -Force -ErrorAction SilentlyContinue
 
     } catch {
         Write-Host "  [ERROR] $($_.Exception.Message)" -ForegroundColor Red

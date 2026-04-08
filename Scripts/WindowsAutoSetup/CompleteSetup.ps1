@@ -226,7 +226,7 @@ function Get-PendingUpdateCount {
     try {
         $session  = New-Object -ComObject Microsoft.Update.Session
         $searcher = $session.CreateUpdateSearcher()
-        $res      = $searcher.Search("IsInstalled=0 and IsHidden=0 and BrowseOnly=0")
+        $res      = $searcher.Search("IsInstalled=0 and IsHidden=0 and BrowseOnly=0 and AutoSelectOnWebSites=1")
         return $res.Updates.Count
     } catch {
         Write-Log "COM API unavailable: $($_.Exception.Message)" "WARN"
@@ -357,7 +357,14 @@ function Watch-UpdateCompletion {
             }
         } catch {}
 
-        Write-Host "  Still updating... ($([ math]::Round(($deadline - (Get-Date)).TotalMinutes)) min remaining)" -ForegroundColor DarkGray
+        # Also check COM API — exit immediately if 0 required updates pending
+        $comCheck = Get-PendingUpdateCount
+        if ($comCheck -eq 0) {
+            Write-Host "  COM API confirms 0 required updates pending - done!" -ForegroundColor Green
+            return "done"
+        }
+
+        Write-Host "  Still updating... ($comCheck pending, $([ math]::Round(($deadline - (Get-Date)).TotalMinutes)) min remaining)" -ForegroundColor DarkGray
     }
 
     Write-Host "  [WARN] Timed out waiting for Windows Update." -ForegroundColor DarkYellow
