@@ -57,6 +57,11 @@
                 </RunSynchronousCommand>
             </RunSynchronous>
 
+            <DynamicUpdate>
+                <Enable>false</Enable>
+                <WillShowUI>Never</WillShowUI>
+            </DynamicUpdate>
+
             <UserData>
                 <AcceptEula>true</AcceptEula>
                 <FullName>User</FullName>
