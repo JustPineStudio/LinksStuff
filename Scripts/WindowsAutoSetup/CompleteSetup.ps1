@@ -119,6 +119,26 @@ if (-not $rebootResume) {
         }
         Write-Host "  Still applying updates... ($waited s)" -ForegroundColor DarkGray
     }
+
+    # Reset Windows Update service to clear any in-progress download session
+    # that Windows auto-started after reboot, which would conflict with Install-WindowsUpdate.
+    Write-Host "  Resetting Windows Update service..." -ForegroundColor DarkGray
+    try {
+        Stop-Service wuauserv -Force -ErrorAction SilentlyContinue
+        $stopped = $false
+        for ($i = 0; $i -lt 30; $i++) {
+            Start-Sleep -Seconds 2
+            if ((Get-Service wuauserv).Status -eq "Stopped") { $stopped = $true; break }
+        }
+        if (-not $stopped) { Write-Host "  [WARN] wuauserv did not stop cleanly - continuing anyway." -ForegroundColor DarkYellow }
+        Start-Service wuauserv -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 5
+        Write-Host "  Windows Update service reset." -ForegroundColor DarkGray
+        Write-Log "wuauserv reset on reboot resume."
+    } catch {
+        Write-Host "  [WARN] Could not reset wuauserv: $($_.Exception.Message)" -ForegroundColor DarkYellow
+        Write-Log "wuauserv reset warning: $($_.Exception.Message)" "WARN"
+    }
 }
 
 # Register persistence so script resumes after reboot during updates
