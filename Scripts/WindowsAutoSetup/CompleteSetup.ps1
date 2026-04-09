@@ -322,6 +322,8 @@ if ($allPassed) {
 }
 Write-Log "Verification done. AllPassed=$allPassed | $($failNotes -join ' | ')"
 Write-Host ""
+Write-Host "  Press any key to clean up and close..." -ForegroundColor White
+$null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
 
 # ============================================================
 # CLEANUP - remove all traces
