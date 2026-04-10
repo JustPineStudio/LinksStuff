@@ -83,15 +83,9 @@ function Is-Done { param([string]$Step)
 if (!(Test-Path $StateDir)) { New-Item -ItemType Directory -Path $StateDir -Force | Out-Null }
 Write-Log "Script launched. PS version: $($PSVersionTable.PSVersion)"
 
-# Detect reboot-resume vs manual launch
-# Reboot-resume = registry key exists AND PC booted less than 10 minutes ago
-$rebootResume = $false
-$regVal = Get-ItemProperty -Path $RegPath -Name $RegName -ErrorAction SilentlyContinue
-if ($regVal) {
-    $lastBoot = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
-    $minutesSinceBoot = (New-TimeSpan -Start $lastBoot -End (Get-Date)).TotalMinutes
-    if ($minutesSinceBoot -lt 10) { $rebootResume = $true }
-}
+# Detect reboot-resume vs manual launch via flag file (reliable across slow update reboots)
+$RebootFlag  = "$StateDir\reboot_pending.flag"
+$rebootResume = Test-Path $RebootFlag
 
 if (-not $rebootResume) {
     Write-Host "  [START] Running all steps from scratch..." -ForegroundColor Cyan
@@ -100,17 +94,15 @@ if (-not $rebootResume) {
         Remove-Item -Force -ErrorAction SilentlyContinue
     Write-Log "State reset - manual launch."
 } else {
-    Write-Log "Reboot resume ($([math]::Round($minutesSinceBoot,1)) min since boot) - keeping state."
+    Remove-Item $RebootFlag -Force -ErrorAction SilentlyContinue
+    Write-Log "Reboot resume (flag file found) - keeping state."
     Write-Host "  [RESUME] Resuming after reboot..." -ForegroundColor Cyan
-    # After a reboot Windows Update may still be finishing the previous install.
-    # Wait until the wuauserv service is idle before we do anything.
+    # Wait for TrustedInstaller to finish applying updates before proceeding.
     Write-Host "  Waiting for Windows Update to finish post-reboot tasks..." -ForegroundColor DarkGray
     $waited = 0
     while ($waited -lt 300) {
         Start-Sleep -Seconds 15
         $waited += 15
-        $svc = Get-Service wuauserv -ErrorAction SilentlyContinue
-        # Also check if TrustedInstaller (which applies updates) is running
         $ti = Get-Process TrustedInstaller -ErrorAction SilentlyContinue
         if (-not $ti) {
             Write-Host "  Windows Update appears idle after $waited seconds." -ForegroundColor DarkGray
@@ -118,26 +110,6 @@ if (-not $rebootResume) {
             break
         }
         Write-Host "  Still applying updates... ($waited s)" -ForegroundColor DarkGray
-    }
-
-    # Reset Windows Update service to clear any in-progress download session
-    # that Windows auto-started after reboot, which would conflict with Install-WindowsUpdate.
-    Write-Host "  Resetting Windows Update service..." -ForegroundColor DarkGray
-    try {
-        Stop-Service wuauserv -Force -ErrorAction SilentlyContinue
-        $stopped = $false
-        for ($i = 0; $i -lt 30; $i++) {
-            Start-Sleep -Seconds 2
-            if ((Get-Service wuauserv).Status -eq "Stopped") { $stopped = $true; break }
-        }
-        if (-not $stopped) { Write-Host "  [WARN] wuauserv did not stop cleanly - continuing anyway." -ForegroundColor DarkYellow }
-        Start-Service wuauserv -ErrorAction SilentlyContinue
-        Start-Sleep -Seconds 5
-        Write-Host "  Windows Update service reset." -ForegroundColor DarkGray
-        Write-Log "wuauserv reset on reboot resume."
-    } catch {
-        Write-Host "  [WARN] Could not reset wuauserv: $($_.Exception.Message)" -ForegroundColor DarkYellow
-        Write-Log "wuauserv reset warning: $($_.Exception.Message)" "WARN"
     }
 }
 
@@ -219,29 +191,66 @@ Start-Sleep -Seconds 1
 
 # ============================================================
 # STEP 3 - WINDOWS UPDATES
-# Opens the Windows Update settings page and clicks the
-# "Check for updates" button exactly like a human would.
-# Monitors progress and reboots if needed, then loops until
-# the page shows "You're up to date".
+# Uses the Windows Update COM API directly (no PSWindowsUpdate
+# module needed). Installs in priority order; reboots and
+# resumes automatically until everything is installed.
 # ============================================================
 Show-Status "Windows Updates"
 
-# Install PSWindowsUpdate module if not already present
-if (-not (Get-Module -ListAvailable -Name PSWindowsUpdate)) {
-    Write-Host "  Installing PSWindowsUpdate module..." -ForegroundColor DarkGray
-    Write-Log "Installing PSWindowsUpdate module."
-    Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force | Out-Null
-    Install-Module -Name PSWindowsUpdate -Force -Confirm:$false | Out-Null
+# Remove NoAutoUpdate policy so the COM API can download freely
+try {
+    Remove-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" `
+        -Name "NoAutoUpdate" -ErrorAction SilentlyContinue
+    Write-Log "NoAutoUpdate policy removed."
+} catch {}
+
+function InstallUpdates {
+    param([string]$Criteria, [string]$Name)
+    Write-Host "  Searching: $Name..." -ForegroundColor DarkGray
+    Write-Log "Searching updates: $Name"
+
+    $Searcher = New-Object -ComObject Microsoft.Update.Searcher
+    $SearchResult = $Searcher.Search($Criteria).Updates
+
+    if ($SearchResult.Count -eq 0) {
+        Write-Host "  [SKIP] No updates found: $Name" -ForegroundColor DarkGray
+        return
+    }
+
+    Write-Host "  Downloading $($SearchResult.Count) update(s): $Name..." -ForegroundColor Yellow
+    Write-Log "Downloading $($SearchResult.Count) updates: $Name"
+    $Session    = New-Object -ComObject Microsoft.Update.Session
+    $Downloader = $Session.CreateUpdateDownloader()
+    $Downloader.Updates = $SearchResult
+    $Downloader.Download()
+
+    Write-Host "  Installing $($SearchResult.Count) update(s): $Name..." -ForegroundColor Yellow
+    Write-Log "Installing $($SearchResult.Count) updates: $Name"
+    foreach ($u in $SearchResult) { $u.AcceptEULA() }
+
+    $Installer = New-Object -ComObject Microsoft.Update.Installer
+    $Installer.Updates = $SearchResult
+    $Result = $Installer.Install()
+
+    if ($Result.RebootRequired) {
+        Write-Log "Reboot required after: $Name"
+        New-Item $RebootFlag -ItemType File -Force | Out-Null
+        Write-Host "  Reboot required. Restarting in 10 seconds..." -ForegroundColor Cyan
+        shutdown.exe /t 10 /r /f
+        exit
+    }
 }
-Import-Module PSWindowsUpdate -ErrorAction Stop
 
-$dateStr  = Get-Date -Format "yyyy-MM-dd"
-$logPath  = "C:\$($env:COMPUTERNAME)-$dateStr-MSUpdates.log"
-Write-Host "  Running updates - log: $logPath" -ForegroundColor DarkGray
+$BaseCriteria = "IsInstalled=0 and IsHidden=0 and AutoSelectOnWebSites=1"
 Write-Host "  Machine will reboot automatically if needed. Setup resumes after restart." -ForegroundColor Cyan
-Write-Log "Starting Install-WindowsUpdate. Log: $logPath"
+Write-Log "Starting Windows Update via COM API."
 
-Install-WindowsUpdate -MicrosoftUpdate -AcceptAll -AutoReboot | Out-File $logPath -Force
+InstallUpdates "$BaseCriteria and CategoryIDs contains '68C5B0A3-D1A6-4553-AE49-01D3A7827828'" "Service Packs"
+InstallUpdates "$BaseCriteria and CategoryIDs contains '28BC880E-0592-4CBF-8F95-C79B17911D5F'" "Update Rollups"
+InstallUpdates "$BaseCriteria and CategoryIDs contains 'E6CF1350-C01B-414D-A61F-263D14D133B4'" "Critical Updates"
+InstallUpdates "$BaseCriteria and CategoryIDs contains '0FA1201D-4330-4FA8-8AE9-B877473B6441'" "Security Updates"
+InstallUpdates "$BaseCriteria and CategoryIDs contains 'E0789628-CE08-4437-BE74-2495B842F43B'" "Definition Updates"
+InstallUpdates "$BaseCriteria and CategoryIDs contains '5C9376AB-8CE6-464A-B136-22113DD69801'" "Applications"
 
 Write-Host "  [OK] Windows Update complete." -ForegroundColor Green
 Write-Log "Windows Update complete - no reboot required."
