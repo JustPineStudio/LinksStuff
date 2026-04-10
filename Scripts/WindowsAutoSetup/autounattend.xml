@@ -228,15 +228,6 @@
                 <ProtectYourPC>3</ProtectYourPC>
             </OOBE>
 
-            <FirstLogonCommands>
-                <SynchronousCommand wcm:action="add">
-                    <Order>1</Order>
-                    <CommandLine>reg delete "HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" /v NoAutoUpdate /f</CommandLine>
-                    <Description>Re-enable Windows Update after OOBE</Description>
-                    <RequiresUserInput>false</RequiresUserInput>
-                </SynchronousCommand>
-            </FirstLogonCommands>
-
         </component>
     </settings>
 
